@@ -1,1 +1,6 @@
 * text=auto !eol
+webdav/__init__.py -text
+webdav/models.py -text
+webdav/templates/webdav/index.html -text
+webdav/tests.py -text
+webdav/views.py -text
