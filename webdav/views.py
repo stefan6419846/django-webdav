@@ -1,7 +1,7 @@
 from django.http import HttpResponse
-from webdav import *
+from webdav import DavServer
 
-def export(request, path, fs_class=None, prop_class=None):
+def export(request, path, server_class=DavServer):
     '''Default Django-WebDAV view.'''
-    return DavRequest(request, path, fs_class=fs_class, prop_class=prop_class).get_response()
+    return server_class(request, path).get_response()
 

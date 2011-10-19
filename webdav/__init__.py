@@ -1,6 +1,7 @@
 import os, datetime, mimetypes
 from django.conf import settings
 from django.http import HttpResponse, HttpResponseForbidden, Http404
+from django.utils.http import http_date
 from django.shortcuts import render_to_response
 
 def safe_join(root, *paths):
@@ -13,6 +14,12 @@ def safe_join(root, *paths):
             path = path[1:]
         root += '/' + path
     return root
+
+def url_join(base, *paths):
+    paths = safe_join(*paths)
+    while base.endswith('/'):
+        base = base[:-1]
+    return base + paths
 
 class xml(object):
     def makeResponse():
@@ -30,50 +37,131 @@ class DavAcl(object):
         self.relocate = relocate
         self.list = list
 
-class DavStat(object):
-    def __init__(self, request, path):
-        root = request.fs.homedir(request.request.user)
-        full_path = safe_join(root, path)
+class DavResource(object):
+    def __init__(self, request, root, path):
+        self.request = request
+        self.root = root
         self.path = path
-        self.url = safe_join(request.base, path)
-        self.url_up = safe_join(request.base, os.path.dirname(path))
-        self.name = os.path.basename(full_path)
-        self.dirname = os.path.dirname(full_path)
-        self.isdir = os.path.isdir(full_path)
-        self.isfile = os.path.isdir(full_path)
-        self.size = os.path.getsize(full_path)
-        self.mtime = datetime.datetime.fromtimestamp(os.stat(full_path).st_mtime)
+
+    def get_path(self):
+        return self.path
+
+    def get_abs_path(self):
+        return safe_join(self.root, self.path)
+
+    def isdir(self):
+        return os.path.isdir(self.get_abs_path())
+
+    def isfile(self):
+        return os.path.isfile(self.get_abs_path())
+
+    def exists(self):
+        return os.path.exists(self.get_abs_path())
+
+    def get_name(self):
+        return os.path.basename(self.path)
+
+    def get_dirname(self):
+        return os.path.dirname(self.get_abs_path())
+
+    def get_size(self):
+        return os.path.getsize(self.get_abs_path())
+
+    def get_mtime(self):
+        return datetime.datetime.fromtimestamp(os.stat(self.get_abs_path()).st_mtime)
+
+    def get_url(self):
+        return url_join(self.request.get_base_url(), self.path)
+
+    def get_parent(self):
+        return self.__class__(self.request, self.root, os.path.dirname(self.path))
+
+    def open(self, mode):
+        return file(self.get_abs_path(), mode)
+
+    def remove(self, path):
+        os.remove(self.get_abs_path())
+
+    def mkdir(self, path):
+        os.mkdir(self.get_abs_path())
+
+    def touch(self, path):
+        os.close(os.open(self.get_abs_path()))
+
 
 class DavRequest(object):
-    def __init__(self, request, path, fs_class=None, prop_class=None):
+    '''Wraps a Django request object, and extends it with some WebDAV
+    specific methods.'''
+    def __init__(self, server, request, path):
+        self.server = server
         self.request = request
-        self.base = request.path[:-len(path)]
-        if fs_class is None:
-            fs_class = DavFileSystem
-        self.fs = fs_class(self)
-        if prop_class is None:
-            prop_class = DavProperties
-        self.prop = prop_class(self)
         self.path = path
 
+    def __getattr__(self, name):
+        return getattr(self.request, name)
+
+    def get_root(self):
+        return self.server.fs.get_root()
+
+    def get_base(self):
+        return self.META['PATH_INFO'][:-len(self.path)]
+
+    def get_base_url(self):
+        return self.build_absolute_uri(self.get_base())
+
+
+class DavFileSystem(object):
+    stat_class = DavResource
+
+    def __init__(self, request):
+        self.request = request
+
+    def get_root(self):
+        return getattr(settings, 'DAV_ROOT', None)
+
+    def access(self, path):
+        '''Return permission as tuple (read, write, delete, create, relocate, list).'''
+        return DavAcl(all=False)
+
+    def listdir(self, path):
+        for child in os.listdir(safe_join(self.get_root(), path)):
+            yield self.stat(safe_join(path, child))
+
+    def stat(self, path):
+        return self.stat_class(self.request, self.get_root(), path)
+
+
+class DavProperties(object):
+    def __init__(self, request):
+        selfrequest = request
+
+
+class DavServer(object):
+    fs_class = DavFileSystem
+    prop_class = DavProperties
+
+    def __init__(self, request, path):
+        self.request = DavRequest(self, request, path)
+        self.fs = self.fs_class(self.request)
+        self.prop = self.prop_class(self.request)
+
     def doGET(self, head=False):
-        root = self.fs.homedir(self.request.user)
-        acl = self.fs.access(self.request.user, self.path)
-        cwd = self.fs.stat(self, self.path)
-        if cwd.isdir:
+        acl = self.fs.access(self.request.path)
+        cwd = self.fs.stat(self.request.path)
+        if cwd.isdir():
             if not acl.list:
                 return HttpResponseForbidden()
-            listing = self.fs.listdir(self.path)
+            listing = self.fs.listdir(self.request.path)
             return render_to_response('webdav/index.html', { 'cwd': cwd, 'listing': listing })
         else:
             if not acl.read:
                 return HttpResponseForbidden()
             if head:
-                response =  HttpResponse(file(safe_join(root, self.path), 'r'))
+                response =  HttpResponse("", 'r')
                 response['Content-Length'] = cwd.size
             else:
-                response =  HttpResponse(file(safe_join(root, self.path), 'r'))
-            response['Content-Type'] = mimetypes.guess_type(cwd.name)
+                response =  HttpResponse(cwd.open('r'))
+            response['Content-Type'] = mimetypes.guess_type(cwd.get_name())
             return response
 
     def doHEAD(self):
@@ -83,19 +171,31 @@ class DavRequest(object):
         raise HttpResponse('Method not allowed: POST', status=405)
 
     def doPUT(self):
-        if self.fs.exists(self.root):
+        acl = self.fs.access(self.path)
+        cwd = self.fs.stat(self, self.path)
+        if cwd.exists() or not acl.upload:
             return HttpResponseForbidden()
+        if not cwd.get_parent().exists():
+            raise Http404()
+        with cwd.open('w') as f:
+            pass # TODO: write file contents
 
     def doDELETE(self):
-        if not self.fs.exists(self.root):
+        acl = self.fs.access(self.path)
+        cwd = self.fs.stat(self, self.path)
+        if not cwd.exists():
             raise Http404()
-        if not self.fs.access(self.root).delete:
+        if not acl.delete:
             return HttpResponseForbidden()
-        self.fs.delete(self.root)
+        cwd.delete(self.path)
         return HttpResponse(xml.makeResponse(), status=200)
 
     def doMKCOL(self):
-        pass
+        acl = self.fs.access(self.path)
+        cwd = self.fs.stat(self, self.path)
+        if not acl.create:
+            return HttpResponseForbidden()
+        cwd.mkdir()
 
     def doCOPY(self):
         pass
@@ -110,7 +210,28 @@ class DavRequest(object):
         pass
 
     def doOPTIONS(self):
-        pass
+        response = HttpResponse()
+        response['Content-Type'] =  'text/html'
+        response['Content-Length'] = '0'
+        response['DAV'] = '1,2'
+        response['Date'] = http_date()
+        if self.path == '/':
+            self.path = '*'
+        if self.path == '*':
+            return response
+        acl = self.fs.access(self.path)
+        cwd = self.fs.stat(self, self.path)
+        if not cwd.exists():
+            cwd = cwd.get_parent()
+            if not cwd.isdir():
+                raise Http404()
+            response['Allow'] = 'OPTIONS PUT MKCOL'
+        elif cwd.isdir:
+            response['Allow'] = 'OPTIONS HEAD GET DELETE PROPFIND PROPPATCH COPY MOVE LOCK UNLOCK'
+        else:
+            response['Allow'] = 'OPTIONS HEAD GET PUT DELETE PROPFIND PROPPATCH COPY MOVE LOCK UNLOCK'
+            response['Allow-Ranges'] = 'bytes'
+        return response
 
     def doPROPFIND(self):
         pass
@@ -123,46 +244,3 @@ class DavRequest(object):
         if not handler:
             raise Http404()
         return handler()
-
-
-class DavProperties(object):
-    def __init__(self, request):
-        selfrequest = request
-
-
-class DavFileSystem(object):
-    def __init__(self, request):
-        self.request = request
-
-    def homedir(self, user):
-        root = getattr(settings, 'DAV_ROOT', None)
-        if not root:
-            raise Http404()
-        return root
-
-    def access(self, user, path):
-        '''Return permission as tuple (read, write, delete, create, relocate, list).'''
-        return DavAcl(all=False)
-
-    def listdir(self, path):
-        root = self.homedir(self.request.request.user)
-        for child in os.listdir(safe_join(root, path)):
-            yield self.stat(root, safe_join(path, child))
-
-    def stat(self, root, path):
-        return DavStat(self.request, path)
-
-    def open(self, path, mode):
-        pass
-
-    def exists(self, path):
-        pass
-
-    def remove(self, path):
-        pass
-
-    def mkdir(self, path):
-        pass
-
-    def touch(self, path):
-        pass
