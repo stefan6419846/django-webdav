@@ -157,7 +157,7 @@ class DavServer(object):
             if not acl.read:
                 return HttpResponseForbidden()
             if head:
-                response =  HttpResponse("", 'r')
+                response =  HttpResponse()
                 response['Content-Length'] = cwd.size
             else:
                 response =  HttpResponse(cwd.open('r'))
