@@ -1,6 +1,5 @@
 * text=auto !eol
 django_webdav/__init__.py -text
-django_webdav/decorators.py -text
 django_webdav/models.py -text
 django_webdav/templates/webdav/index.html -text
 django_webdav/tests.py -text
