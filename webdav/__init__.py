@@ -1,7 +1,8 @@
-import os, datetime, mimetypes, time
+import os, datetime, mimetypes, time, shutil
 from xml.etree import ElementTree
 from django.conf import settings
-from django.http import HttpResponse, HttpResponseForbidden, Http404
+from django.http import HttpResponse, HttpResponseForbidden, HttpResponseNotFound, \
+HttpResponseNotAllowed, HttpResponseBadRequest, HttpResponseNotModified
 from django.utils import hashcompat
 from django.utils.http import http_date
 from django.utils.encoding import smart_unicode
@@ -39,6 +40,22 @@ def rfc3339_date(date):
   if time.daylight:
     date += datetime.timedelta(seconds=time.altzone)
   return date.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+class HttpResponseCreated(HttpResponse):
+    status_code = 201
+
+
+class HttpResponseNoContent(HttpResponse):
+    status_code = 204
+
+
+class HttpResponseMultiStatus(HttpResponse):
+    status_code = 207
+
+
+class HttpResponseNotImplemented(HttpResponse):
+    status_code = 501
 
 
 class DavAcl(object):
@@ -212,14 +229,27 @@ class DavProperties(object):
         return found, missing
 
 
+class DavLock(object):
+    def __init__(self, request):
+        self.request = request
+
+    def acquire(self, url, type, scope, depth, owner, timeout):
+        pass
+
+    def release(self):
+        pass
+
+
 class DavServer(object):
     fs_class = DavFileSystem
     pm_class = DavProperties
+    lk_class = DavLock
 
     def __init__(self, request, path):
         self.request = DavRequest(self, request, path)
         self.fs = self.fs_class(self.request)
         self.pm = self.pm_class(self.request)
+        self.lk = self.lk_class(self.request)
 
     def doGET(self, head=False):
         acl = self.fs.access(self.request.path)
@@ -243,7 +273,7 @@ class DavServer(object):
         return self.doGET(head=True)
 
     def doPOST(self):
-        raise HttpResponse('Method not allowed: POST', status=405)
+        return HttpResponseNotAllowed('POST method not allowed')
 
     def doPUT(self):
         acl = self.fs.access(self.request.path)
@@ -251,31 +281,36 @@ class DavServer(object):
         if cwd.exists() or not acl.upload:
             return HttpResponseForbidden()
         if not cwd.get_parent().exists():
-            raise Http404()
+            return HttpResponseNotFound()
+        created = not cwd.exists()
         with cwd.open('w') as f:
-            pass # TODO: write file contents
+            shutil.copyfileobj(self.request, f)
+        if created:
+            return HttpResponseCreated()
+        else:
+            return HttpResponseNoContent()
 
     def doDELETE(self):
         cwd = self.fs.stat(self.request.path)
         if not cwd.exists():
-            raise Http404()
+            return HttpResponseNotFound()
         acl = self.fs.access(self.request.path)
         if not acl.delete:
             return HttpResponseForbidden()
         cwd.remove()
-        response = HttpResponse(status=204, mimetype='application/xml')
+        response = HttpResponseNoContent()
         response['Date'] = http_date()
         return response
 
     def doMKCOL(self):
         cwd = self.fs.stat(self.request.path)
         if cwd.exists():
-            return HttpResponse(status=405)
+            return HttpResponseNotAllowed()
         acl = self.fs.access(self.request.path)
         if not acl.create:
             return HttpResponseForbidden()
         cwd.mkdir()
-        return HttpResponse(status=201)
+        return HttpResponseCreated()
 
     def doCOPY(self, move=False):
         pass
@@ -284,10 +319,10 @@ class DavServer(object):
         return self.doCOPY(move=True)
 
     def doLOCK(self):
-        pass
+        return HttpResponseNotImplemented()
 
     def doUNLOCK(self):
-        pass
+        return HttpResponseNotImplemented()
 
     def doOPTIONS(self):
         response = HttpResponse(mimetype='text/html')
@@ -300,7 +335,7 @@ class DavServer(object):
         if not cwd.exists():
             cwd = cwd.get_parent()
             if not cwd.isdir():
-                raise Http404()
+                return HttpResponseNotFound()
             response['Allow'] = 'OPTIONS PUT MKCOL'
         elif cwd.isdir():
             response['Allow'] = 'OPTIONS HEAD GET DELETE PROPFIND PROPPATCH COPY MOVE LOCK UNLOCK'
@@ -322,10 +357,10 @@ class DavServer(object):
         acl = self.fs.access(self.request.path)
         cwd = self.fs.stat(self.request.path)
         if not cwd.exists():
-            raise Http404()
+            return HttpResponseNotFound()
         depth = self.request.META.get('HTTP_DEPTH', 'infinity').lower()
         if not depth in ('0', '1', 'infinity'):
-            return HttpResponse('Invalid depth header value %s' % depth, status=400)
+            return HttpResponseBadRequest('Invalid depth header value %s' % depth)
         if depth == 'infinity':
             depth = -1
         else:
@@ -334,12 +369,12 @@ class DavServer(object):
         for ev, el in ElementTree.iterparse(self.request):
             if el.tag == '{DAV:}allprop':
                 if props:
-                    return HttpResponse(status=400)
+                    return HttpResponseBadRequest()
             elif el.tag == '{DAV:}propname':
                 names_only = True
             elif el.tag == '{DAV:}prop':
                 if names_only:
-                    return HttpResponse(status=400)
+                    return HttpResponseBadRequest()
                 for pr in el:
                     props.append(pr.tag)
         msr = ElementTree.Element('{DAV:}multistatus')
@@ -363,7 +398,7 @@ class DavServer(object):
                 for name in missing:
                     prop = ElementTree.SubElement(propstat, '{DAV:}prop')
                     prop = ElementTree.SubElement(prop, name)
-        response = HttpResponse(ElementTree.tostring(msr, 'UTF-8'), status=207, mimetype='application/xml')
+        response = HttpResponseMultiStatus(ElementTree.tostring(msr, 'UTF-8'), mimetype='application/xml')
         response['Date'] = http_date()
         return response
 
@@ -373,5 +408,5 @@ class DavServer(object):
     def get_response(self):
         handler = getattr(self, 'do' + self.request.method, None)
         if not handler:
-            raise Http404()
+            return HttpResponseNotFound()
         return handler()
