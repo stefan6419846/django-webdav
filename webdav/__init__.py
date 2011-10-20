@@ -1,7 +1,9 @@
 import os, datetime, mimetypes
+from xml.etree import ElementTree
 from django.conf import settings
 from django.http import HttpResponse, HttpResponseForbidden, Http404
 from django.utils.http import http_date
+from django.utils.encoding import smart_unicode
 from django.shortcuts import render_to_response
 
 def safe_join(root, *paths):
@@ -21,9 +23,11 @@ def url_join(base, *paths):
         base = base[:-1]
     return base + paths
 
-class xml(object):
-    def makeResponse():
-        pass
+def split_ns(tag):
+    if tag.startswith("{") and "}" in tag:
+        ns, name = tag.split("}", 1)
+        return (ns[1:], name)
+    return ("", tag)
 
 class DavAcl(object):
     def __init__(self, read=True, write=True, delete=True, create=True, relocate=True, list=True, all=None):
@@ -76,6 +80,38 @@ class DavResource(object):
     def get_parent(self):
         return self.__class__(self.request, self.root, os.path.dirname(self.path))
 
+    def get_descendants(self, depth=1, include_self=True):
+        if include_self:
+            yield self
+        if depth != 0:
+            for child in self.listdir():
+                for desc in child.get_descendants(depth=depth-1, include_self=True):
+                    yield desc
+
+    def listdir(self):
+        for child in os.listdir(self.get_abs_path()):
+            yield self.__class__(self.request, self.root, os.path.join(self.get_name(), child))
+
+    def get_properties(self, *names, **kwargs):
+        names_only = kwargs.get('names_only', False)
+        found, missing = [], []
+        for name in names:
+            if names_only:
+                found.append((name, None))
+            else:
+                ns, name = split_ns(name)
+                if name == 'getlastmodified':
+                    value = self.get_mtime()
+                if name == 'resourcetype':
+                    if self.isdir():
+                        value = ElementTree.Element("{DAV:}collection")
+                    else:
+                        value = ''
+                else:
+                    value = 'foo'
+                found.append((name, value))
+        return found, missing
+
     def open(self, mode):
         return file(self.get_abs_path(), mode)
 
@@ -123,10 +159,6 @@ class DavFileSystem(object):
         '''Return permission as tuple (read, write, delete, create, relocate, list).'''
         return DavAcl(all=False)
 
-    def listdir(self, path):
-        for child in os.listdir(safe_join(self.get_root(), path)):
-            yield self.stat(safe_join(path, child))
-
     def stat(self, path):
         return self.stat_class(self.request, self.get_root(), path)
 
@@ -151,8 +183,7 @@ class DavServer(object):
         if cwd.isdir():
             if not acl.list:
                 return HttpResponseForbidden()
-            listing = self.fs.listdir(self.request.path)
-            return render_to_response('webdav/index.html', { 'cwd': cwd, 'listing': listing })
+            return render_to_response('webdav/index.html', { 'cwd': cwd, 'listing': cwd.listdir() })
         else:
             if not acl.read:
                 return HttpResponseForbidden()
@@ -171,8 +202,8 @@ class DavServer(object):
         raise HttpResponse('Method not allowed: POST', status=405)
 
     def doPUT(self):
-        acl = self.fs.access(self.path)
-        cwd = self.fs.stat(self, self.path)
+        acl = self.fs.access(self.request.path)
+        cwd = self.fs.stat(self.request.path)
         if cwd.exists() or not acl.upload:
             return HttpResponseForbidden()
         if not cwd.get_parent().exists():
@@ -181,10 +212,10 @@ class DavServer(object):
             pass # TODO: write file contents
 
     def doDELETE(self):
-        acl = self.fs.access(self.path)
-        cwd = self.fs.stat(self, self.path)
+        cwd = self.fs.stat(self.request.path)
         if not cwd.exists():
             raise Http404()
+        acl = self.fs.access(self.request.path)
         if not acl.delete:
             return HttpResponseForbidden()
         cwd.delete(self.path)
@@ -215,18 +246,16 @@ class DavServer(object):
         response['Content-Length'] = '0'
         response['DAV'] = '1,2'
         response['Date'] = http_date()
-        if self.path == '/':
-            self.path = '*'
-        if self.path == '*':
+        if self.request.path in ('/', '*'):
             return response
-        acl = self.fs.access(self.path)
-        cwd = self.fs.stat(self, self.path)
+        acl = self.fs.access(self.request.path)
+        cwd = self.fs.stat(self.request.path)
         if not cwd.exists():
             cwd = cwd.get_parent()
             if not cwd.isdir():
                 raise Http404()
             response['Allow'] = 'OPTIONS PUT MKCOL'
-        elif cwd.isdir:
+        elif cwd.isdir():
             response['Allow'] = 'OPTIONS HEAD GET DELETE PROPFIND PROPPATCH COPY MOVE LOCK UNLOCK'
         else:
             response['Allow'] = 'OPTIONS HEAD GET PUT DELETE PROPFIND PROPPATCH COPY MOVE LOCK UNLOCK'
@@ -234,7 +263,62 @@ class DavServer(object):
         return response
 
     def doPROPFIND(self):
-        pass
+        # <?xml version="1.0" encoding="utf-8"?>
+        # <propfind xmlns="DAV:"><prop>
+        # <getetag xmlns="DAV:"/>
+        # <getcontentlength xmlns="DAV:"/>
+        # <creationdate xmlns="DAV:"/>
+        # <getlastmodified xmlns="DAV:"/>
+        # <resourcetype xmlns="DAV:"/>
+        # <executable xmlns="http://apache.org/dav/props/"/>
+        # </prop></propfind>
+        acl = self.fs.access(self.request.path)
+        cwd = self.fs.stat(self.request.path)
+        if not cwd.exists():
+            raise Http404()
+        depth = self.request.META.get('HTTP_DEPTH', 'infinity').lower()
+        if not depth in ('0', '1', 'infinity'):
+            return HttpResponse('Invalid depth header value %s' % depth, status=400)
+        if depth == 'infinity':
+            depth = -1
+        else:
+            depth = int(depth)
+        names_only, props = False, []
+        for ev, el in ElementTree.iterparse(self.request):
+            if el.tag == '{DAV:}allprop':
+                if props:
+                    return HttpResponse(status=400)
+            elif el.tag == '{DAV:}propname':
+                names_only = True
+            elif el.tag == '{DAV:}prop':
+                if names_only:
+                    return HttpResponse(status=400)
+                for pr in el:
+                    props.append(pr.tag)
+        msr = ElementTree.Element('{DAV:}multistatus')
+        for child in cwd.get_descendants(depth=depth, include_self=True):
+            response = ElementTree.SubElement(msr, '{DAV:}response')
+            ElementTree.SubElement(response, '{DAV:}href').text = child.get_url()
+            found, missing = child.get_properties(*props, names_only=names_only)
+            if found:
+                propstat = ElementTree.SubElement(response, '{DAV:}propstat')
+                ElementTree.SubElement(propstat, '{DAV:}status').text = 'HTTP/1.1 200 OK'
+                for name, value in found:
+                    prop = ElementTree.SubElement(propstat, '{DAV:}prop')
+                    prop = ElementTree.SubElement(prop, name)
+                    if ElementTree.iselement(value):
+                        prop.append(value)
+                    elif value:
+                        prop.text = smart_unicode(value)
+            if missing:
+                propstat = ElementTree.SubElement(response, '{DAV:}propstat')
+                ElementTree.SubElement(propstat, '{DAV:}status').text = 'HTTP/1.1 404 Not Found'
+                for name in missing:
+                    prop = ElementTree.SubElement(propstat, '{DAV:}prop')
+                    prop = ElementTree.SubElement(prop, name)
+        response = HttpResponse(ElementTree.tostring(msr, 'UTF-8'), status=207, mimetype='application/xml')
+        response['Date'] = http_date()
+        return response
 
     def doPROPPATCH(self):
         pass
