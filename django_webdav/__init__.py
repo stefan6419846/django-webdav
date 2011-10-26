@@ -1,4 +1,4 @@
-import os, datetime, mimetypes, time, shutil
+import os, datetime, mimetypes, time, shutil, urllib, urlparse
 from xml.etree import ElementTree
 from django.conf import settings
 from django.http import HttpResponse, HttpResponseForbidden, HttpResponseNotFound, \
@@ -10,7 +10,7 @@ from django.shortcuts import render_to_response
 
 DAV_LIVE_PROPERTIES = (
     '{DAV:}getetag', '{DAV:}getcontentlength', '{DAV:}creationdate',
-    '{DAV:}getlastmodified', '{DAV:}resourcetype'
+    '{DAV:}getlastmodified', '{DAV:}resourcetype', '{DAV:}displayname'
 )
 
 def safe_join(root, *paths):
@@ -59,8 +59,20 @@ class HttpResponseMultiStatus(HttpResponse):
     status_code = 207
 
 
+class HttpResponseNotAllowed(HttpResponse):
+    status_code = 405
+
+
+class HttpResponsePreconditionFailed(HttpResponse):
+    status_code = 412
+
+
 class HttpResponseNotImplemented(HttpResponse):
     status_code = 501
+
+
+class HttpResponseBadGateway(HttpResponse):
+    status_code = 502
 
 
 class DavAcl(object):
@@ -131,21 +143,23 @@ class DavResource(object):
         if include_self:
             yield self
         if depth != 0:
-            for child in self.listdir():
+            for child in self.get_children():
                 for desc in child.get_descendants(depth=depth-1, include_self=True):
                     yield desc
 
-    def listdir(self):
+    def get_children(self):
         for child in os.listdir(self.get_abs_path()):
             yield self.__class__(self.request, self.root, os.path.join(self.get_name(), child))
 
     def open(self, mode):
         return file(self.get_abs_path(), mode)
 
-    def remove(self):
+    def delete(self):
         if self.isdir():
+            for child in self.get_children():
+                child.delete()
             os.rmdir(self.get_abs_path())
-        else:
+        elif self.isfile():
             os.remove(self.get_abs_path())
 
     def mkdir(self):
@@ -153,6 +167,33 @@ class DavResource(object):
 
     def touch(self):
         os.close(os.open(self.get_abs_path()))
+
+    def copy(self, destination, depth=0):
+        if self.isdir():
+            destination.mkdir()
+            if depth > 0:
+                for child in self.get_children():
+                    child.copy(safe_join(destination.get_abs_path(), child.get_name()), depth=depth-1)
+        else:
+            with destination.open('w') as dst:
+                with self.open('r') as src:
+                    shutil.copyfileobj(src, dst)
+
+    def move(self, destination):
+        if self.isdir():
+            destination.mkdir()
+            for child in self.get_children():
+                child.move(safe_join(destination.get_abs_path(), child.get_name()))
+            self.delete()
+        else:
+            os.rename(self.get_abs_path(), destination.get_abs_path())
+
+    def get_etag(self):
+        hash = hashcompat.md5_constructor()
+        hash.update(self.get_abs_path())
+        hash.update(str(self.get_mtime_stamp()))
+        hash.update(str(self.get_size()))
+        return hash.hexdigest()
 
 
 class DavRequest(object):
@@ -208,11 +249,7 @@ class DavProperties(object):
                 value = None
                 ns, bare_name = split_ns(name)
                 if bare_name == 'getetag':
-                    hash = hashcompat.md5_constructor()
-                    hash.update(res.get_abs_path())
-                    hash.update(str(res.get_mtime_stamp()))
-                    hash.update(str(res.get_size()))
-                    value = hash.hexdigest()
+                    value = res.get_etag()
                 elif bare_name == 'getcontentlength':
                     value = str(res.get_size())
                 elif bare_name == 'creationdate':
@@ -221,11 +258,15 @@ class DavProperties(object):
                 elif bare_name == 'getlastmodified':
                     # RFC1123:
                     value = http_date(res.get_mtime_stamp())
-                if bare_name == 'resourcetype':
+                elif bare_name == 'resourcetype':
                     if res.isdir():
                         value = ElementTree.Element("{DAV:}collection")
                     else:
                         value = ''
+                elif bare_name == 'displayname':
+                    value = res.get_name()
+                elif bare_name == 'href':
+                    value = res.get_url()
                 if value is None:
                     missing.append(name)
                 else:
@@ -256,22 +297,28 @@ class DavServer(object):
         self.lk = self.lk_class(self.request)
 
     def doGET(self, head=False):
-        acl = self.fs.access(self.request.path)
-        cwd = self.fs.stat(self.request.path)
-        if cwd.isdir():
+        res = self.fs.stat(self.request.path)
+        acl = self.fs.access(res.get_abs_path())
+        if res.isdir():
             if not acl.list:
                 return HttpResponseForbidden()
-            return render_to_response('webdav/index.html', { 'cwd': cwd, 'listing': cwd.listdir() })
+            return render_to_response('webdav/index.html', { 'res': res })
         else:
             if not acl.read:
                 return HttpResponseForbidden()
-            if head:
-                response =  HttpResponse()
-                response['Content-Length'] = cwd.size
+            if head and res.exists():
+                response = HttpResponse()
+            elif head:
+                response = HttpResponseNotFound()
             else:
-                response =  HttpResponse(cwd.open('r'))
-            response['Content-Type'] = mimetypes.guess_type(cwd.get_name())
-            return response
+                response =  HttpResponse(res.open('r'))
+            if res.exists():
+                response['Content-Type'] = mimetypes.guess_type(res.get_name())
+                response['Content-Length'] = res.get_size()
+                response['Last-Modified'] = http_date(res.get_mtime_stamp())
+                response['ETag'] = res.get_etag()
+            response['Date'] = http_date()
+        return response
 
     def doHEAD(self):
         return self.doGET(head=True)
@@ -280,14 +327,16 @@ class DavServer(object):
         return HttpResponseNotAllowed('POST method not allowed')
 
     def doPUT(self):
-        acl = self.fs.access(self.request.path)
-        cwd = self.fs.stat(self.request.path)
-        if cwd.exists() or not acl.upload:
-            return HttpResponseForbidden()
-        if not cwd.get_parent().exists():
+        res = self.fs.stat(self.request.path)
+        if res.isdir():
+            return HttpResponseNotAllowed()
+        if not res.get_parent().exists():
             return HttpResponseNotFound()
-        created = not cwd.exists()
-        with cwd.open('w') as f:
+        acl = self.fs.access(res.get_abs_path())
+        if not acl.write:
+            return HttpResponseForbidden()
+        created = not res.exists()
+        with res.open('w') as f:
             shutil.copyfileobj(self.request, f)
         if created:
             return HttpResponseCreated()
@@ -295,29 +344,75 @@ class DavServer(object):
             return HttpResponseNoContent()
 
     def doDELETE(self):
-        cwd = self.fs.stat(self.request.path)
-        if not cwd.exists():
+        res = self.fs.stat(self.request.path)
+        if not res.exists():
             return HttpResponseNotFound()
-        acl = self.fs.access(self.request.path)
+        acl = self.fs.access(res.get_abs_path())
         if not acl.delete:
             return HttpResponseForbidden()
-        cwd.remove()
+        res.delete()
         response = HttpResponseNoContent()
         response['Date'] = http_date()
         return response
 
     def doMKCOL(self):
-        cwd = self.fs.stat(self.request.path)
-        if cwd.exists():
+        res = self.fs.stat(self.request.path)
+        if res.exists():
             return HttpResponseNotAllowed()
-        acl = self.fs.access(self.request.path)
+        acl = self.fs.access(res.get_abs_path())
         if not acl.create:
             return HttpResponseForbidden()
-        cwd.mkdir()
+        res.mkdir()
         return HttpResponseCreated()
 
     def doCOPY(self, move=False):
-        pass
+        res = self.fs.stat(self.request.path)
+        if not res.exists():
+            return HtpResponseNotFound()
+        acl = self.fs.access(res.get_abs_path())
+        if not acl.relocate:
+            return HttpResponseForbidden()
+        dst = urllib.unquote(self.request.META.get('HTTP_DESTINATION', ''))
+        if not dst:
+            return HttpResponseBadRequest('Destination header missing.')
+        dparts = urlparse.urlparse(dst)
+        # TODO: ensure host and scheme portion matches ours...
+        sparts = urlparse.urlparse(self.request.build_absolute_uri())
+        if sparts.scheme != dparts.scheme or sparts.netloc != dparts.netloc:
+            return HttpResponseBadGateway('Source and destination must have the same scheme and host.')
+        # adjust path for our base url:
+        dst = self.fs.stat(uparts.path[len(self.request.get_base()):])
+        overwrite = self.request.META.get('HTTP_OVERWRITE', 'T')
+        if overwrite not in ('T', 'F'):
+            return HttpResponseBadRequest('Overwrite header must be T or F.')
+        overwrite = (overwrite == 'T')
+        if dst.isdir():
+            dst = self.fs.stat(safe_join(dst.get_path(), res.get_name()))
+        if not overwrite and dst.isfile():
+            return HttpResponsePreconditionFailed('Destination exists and overwrite False.')
+        depth = self.request.META.get('HTTP_DEPTH', 'infinity').lower()
+        if not depth in ('0', '1', 'infinity'):
+            return HttpResponseBadRequest('Invalid depth header value %s' % depth)
+        if depth == 'infinity':
+            depth = -1
+        else:
+            depth = int(depth)
+        if move and depth != -1:
+            return HttpResponseBadRequest()
+        if depth not in (0, -1):
+            return HttpResponseBadRequest()
+        if dst.exists():
+            response = HttpResponseNoContent()
+        else:
+            response = HttpResponseCreated()
+        if move:
+            dst.delete()
+            errors = res.move(dst)
+        else:
+            errors = res.copy(dst, depth=depth)
+        if errors:
+            response = HttpResponseMultiStatus()
+        return response
 
     def doMOVE(self):
         return self.doCOPY(move=True)
@@ -334,14 +429,14 @@ class DavServer(object):
         response['Date'] = http_date()
         if self.request.path in ('/', '*'):
             return response
-        acl = self.fs.access(self.request.path)
-        cwd = self.fs.stat(self.request.path)
-        if not cwd.exists():
-            cwd = cwd.get_parent()
-            if not cwd.isdir():
+        res = self.fs.stat(self.request.path)
+        acl = self.fs.access(res.get_abs_path())
+        if not res.exists():
+            res = res.get_parent()
+            if not res.isdir():
                 return HttpResponseNotFound()
             response['Allow'] = 'OPTIONS PUT MKCOL'
-        elif cwd.isdir():
+        elif res.isdir():
             response['Allow'] = 'OPTIONS HEAD GET DELETE PROPFIND PROPPATCH COPY MOVE LOCK UNLOCK'
         else:
             response['Allow'] = 'OPTIONS HEAD GET PUT DELETE PROPFIND PROPPATCH COPY MOVE LOCK UNLOCK'
@@ -349,19 +444,12 @@ class DavServer(object):
         return response
 
     def doPROPFIND(self):
-        # <?xml version="1.0" encoding="utf-8"?>
-        # <propfind xmlns="DAV:"><prop>
-        # <getetag xmlns="DAV:"/>
-        # <getcontentlength xmlns="DAV:"/>
-        # <creationdate xmlns="DAV:"/>
-        # <getlastmodified xmlns="DAV:"/>
-        # <resourcetype xmlns="DAV:"/>
-        # <executable xmlns="http://apache.org/dav/props/"/>
-        # </prop></propfind>
-        acl = self.fs.access(self.request.path)
-        cwd = self.fs.stat(self.request.path)
-        if not cwd.exists():
+        res = self.fs.stat(self.request.path)
+        if not res.exists():
             return HttpResponseNotFound()
+        acl = self.fs.access(res.get_abs_path())
+        if not acl.list:
+            return HttpResponseForbidden()
         depth = self.request.META.get('HTTP_DEPTH', 'infinity').lower()
         if not depth in ('0', '1', 'infinity'):
             return HttpResponseBadRequest('Invalid depth header value %s' % depth)
@@ -386,7 +474,7 @@ class DavServer(object):
                     for pr in el:
                         props.append(pr.tag)
         msr = ElementTree.Element('{DAV:}multistatus')
-        for child in cwd.get_descendants(depth=depth, include_self=True):
+        for child in res.get_descendants(depth=depth, include_self=True):
             response = ElementTree.SubElement(msr, '{DAV:}response')
             ElementTree.SubElement(response, '{DAV:}href').text = child.get_url()
             found, missing = self.pm.get_properties(child, *props, names_only=names_only)
