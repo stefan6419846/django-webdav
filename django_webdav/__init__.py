@@ -8,6 +8,11 @@ from django.utils.http import http_date
 from django.utils.encoding import smart_unicode
 from django.shortcuts import render_to_response
 
+DAV_LIVE_PROPERTIES = (
+    '{DAV:}getetag', '{DAV:}getcontentlength', '{DAV:}creationdate',
+    '{DAV:}getlastmodified', '{DAV:}resourcetype'
+)
+
 def safe_join(root, *paths):
     if not root.startswith('/'):
         root = '/' + root
@@ -197,8 +202,7 @@ class DavProperties(object):
         found, missing = [], []
         for name in names:
             if names_only:
-                if name in ('{DAV:}getetag', '{DAV:}getcontentlength', '{DAV:}creationdate',
-                            '{DAV:}getlastmodified', '{DAV:}resourcetype'):
+                if name in DAV_LIVE_PROPERTIES:
                     found.append((name, None))
             else:
                 value = None
@@ -366,17 +370,21 @@ class DavServer(object):
         else:
             depth = int(depth)
         names_only, props = False, []
-        for ev, el in ElementTree.iterparse(self.request):
-            if el.tag == '{DAV:}allprop':
-                if props:
-                    return HttpResponseBadRequest()
-            elif el.tag == '{DAV:}propname':
-                names_only = True
-            elif el.tag == '{DAV:}prop':
-                if names_only:
-                    return HttpResponseBadRequest()
-                for pr in el:
-                    props.append(pr.tag)
+        if int(self.request.META.get('CONTENT_LENGTH', 0)) == 0:
+            # Allow empty request, must be treated as request for all properties.
+            props = DAV_LIVE_PROPERTIES
+        else:
+            for ev, el in ElementTree.iterparse(self.request):
+                if el.tag == '{DAV:}allprop':
+                    if props:
+                        return HttpResponseBadRequest()
+                elif el.tag == '{DAV:}propname':
+                    names_only = True
+                elif el.tag == '{DAV:}prop':
+                    if names_only:
+                        return HttpResponseBadRequest()
+                    for pr in el:
+                        props.append(pr.tag)
         msr = ElementTree.Element('{DAV:}multistatus')
         for child in cwd.get_descendants(depth=depth, include_self=True):
             response = ElementTree.SubElement(msr, '{DAV:}response')
