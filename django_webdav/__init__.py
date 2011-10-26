@@ -299,7 +299,7 @@ class DavServer(object):
     def doGET(self, head=False):
         res = self.fs.stat(self.request.path)
         acl = self.fs.access(res.get_abs_path())
-        if res.isdir():
+        if not head and res.isdir():
             if not acl.list:
                 return HttpResponseForbidden()
             return render_to_response('webdav/index.html', { 'res': res })
@@ -381,7 +381,7 @@ class DavServer(object):
         if sparts.scheme != dparts.scheme or sparts.netloc != dparts.netloc:
             return HttpResponseBadGateway('Source and destination must have the same scheme and host.')
         # adjust path for our base url:
-        dst = self.fs.stat(uparts.path[len(self.request.get_base()):])
+        dst = self.fs.stat(dparts.path[len(self.request.get_base()):])
         overwrite = self.request.META.get('HTTP_OVERWRITE', 'T')
         if overwrite not in ('T', 'F'):
             return HttpResponseBadRequest('Overwrite header must be T or F.')
@@ -499,7 +499,7 @@ class DavServer(object):
         return response
 
     def doPROPPATCH(self):
-        pass
+        return HttpResponseNotImplemented()
 
     def get_response(self):
         handler = getattr(self, 'do' + self.request.method, None)
