@@ -156,7 +156,7 @@ class DavResource(object):
 
     def get_ctime_stamp(self):
         '''Return the create time as UNIX timestamp.'''
-        return os.get_resource(self.get_abs_path()).st_ctime
+        return os.stat(self.get_abs_path()).st_ctime
 
     def get_ctime(self):
         '''Return the create time as datetime object.'''
@@ -164,7 +164,7 @@ class DavResource(object):
 
     def get_mtime_stamp(self):
         '''Return the modified time as UNIX timestamp.'''
-        return os.get_resource(self.get_abs_path()).st_mtime
+        return os.stat(self.get_abs_path()).st_mtime
 
     def get_mtime(self):
         '''Return the modified time as datetime object.'''
@@ -305,7 +305,7 @@ class DavFileSystem(object):
         this method to export a different directory (maybe even different per user).'''
         return getattr(settings, 'DAV_ROOT', None)
 
-    def get_acl(self, path):
+    def get_acess(self, path):
         '''Return permission as DavAcl object. A DavACL should have the following attributes:
         read, write, delete, create, relocate, list. By default we implement a read-only
         system.'''
@@ -381,7 +381,7 @@ class DavServer(object):
 
     def doGET(self, head=False):
         res = self.fs.get_resource(self.request.path)
-        acl = self.fs.get_acl(res.get_abs_path())
+        acl = self.fs.get_access(res.get_abs_path())
         if not head and res.isdir():
             if not acl.list:
                 return HttpResponseForbidden()
@@ -415,7 +415,7 @@ class DavServer(object):
             return HttpResponseNotAllowed()
         if not res.get_parent().exists():
             return HttpResponseNotFound()
-        acl = self.fs.get_acl(res.get_abs_path())
+        acl = self.fs.get_access(res.get_abs_path())
         if not acl.write:
             return HttpResponseForbidden()
         created = not res.exists()
@@ -430,7 +430,7 @@ class DavServer(object):
         res = self.fs.get_resource(self.request.path)
         if not res.exists():
             return HttpResponseNotFound()
-        acl = self.fs.get_acl(res.get_abs_path())
+        acl = self.fs.get_access(res.get_abs_path())
         if not acl.delete:
             return HttpResponseForbidden()
         res.delete()
@@ -447,7 +447,7 @@ class DavServer(object):
         length = self.request.META.get('CONTENT_LENGTH', 0)
         if length and int(length) != 0:
             return HttpResponseMediatypeNotSupported()
-        acl = self.fs.get_acl(res.get_abs_path())
+        acl = self.fs.get_access(res.get_abs_path())
         if not acl.create:
             return HttpResponseForbidden()
         res.mkdir()
@@ -457,7 +457,7 @@ class DavServer(object):
         res = self.fs.get_resource(self.request.path)
         if not res.exists():
             return HtpResponseNotFound()
-        acl = self.fs.get_acl(res.get_abs_path())
+        acl = self.fs.get_access(res.get_abs_path())
         if not acl.relocate:
             return HttpResponseForbidden()
         dst = urllib.unquote(self.request.META.get('HTTP_DESTINATION', ''))
@@ -519,7 +519,7 @@ class DavServer(object):
         if self.request.path in ('/', '*'):
             return response
         res = self.fs.get_resource(self.request.path)
-        acl = self.fs.get_acl(res.get_abs_path())
+        acl = self.fs.get_access(res.get_abs_path())
         if not res.exists():
             res = res.get_parent()
             if not res.isdir():
@@ -536,7 +536,7 @@ class DavServer(object):
         res = self.fs.get_resource(self.request.path)
         if not res.exists():
             return HttpResponseNotFound()
-        acl = self.fs.get_acl(res.get_abs_path())
+        acl = self.fs.get_access(res.get_abs_path())
         if not acl.list:
             return HttpResponseForbidden()
         depth = self.request.META.get('HTTP_DEPTH', 'infinity').lower()
