@@ -33,7 +33,7 @@ def url_join(base, *paths):
 def split_ns(tag):
     if tag.startswith("{") and "}" in tag:
         ns, name = tag.split("}", 1)
-        return (ns[1:], name)
+        return (ns[1:-1], name)
     return ("", tag)
 
 def rfc3339_date(date):
@@ -61,6 +61,14 @@ class HttpResponseMultiStatus(HttpResponse):
 
 class HttpResponseNotAllowed(HttpResponse):
     status_code = 405
+
+
+class HttpResponseConflict(HttpResponse):
+    status_code = 409
+
+
+class HttpResponseMediatypeNotSupported(HttpResponse):
+    status_code = 415
 
 
 class HttpResponsePreconditionFailed(HttpResponse):
@@ -92,6 +100,8 @@ class DavResource(object):
     def __init__(self, request, root, path):
         self.request = request
         self.root = root
+        while path.endswith('/'):
+            path = path[:-1]
         self.path = path
 
     def get_path(self):
@@ -149,7 +159,7 @@ class DavResource(object):
 
     def get_children(self):
         for child in os.listdir(self.get_abs_path()):
-            yield self.__class__(self.request, self.root, os.path.join(self.get_name(), child))
+            yield self.__class__(self.request, self.root, os.path.join(self.get_path(), child))
 
     def open(self, mode):
         return file(self.get_abs_path(), mode)
@@ -170,27 +180,34 @@ class DavResource(object):
 
     def copy(self, destination, depth=0):
         if self.isdir():
-            destination.mkdir()
-            if depth > 0:
+            if destination.isfile():
+                destination.delete()
+            if not destination.isdir():
+                destination.mkdir()
+            if depth != 0:
                 for child in self.get_children():
-                    child.copy(safe_join(destination.get_abs_path(), child.get_name()), depth=depth-1)
+                    child.copy(self.__class__(self.request, self.root, safe_join(destination.get_path(), child.get_name())), depth=depth-1)
         else:
+            if destination.isdir():
+                destination.delete()
             with destination.open('w') as dst:
                 with self.open('r') as src:
                     shutil.copyfileobj(src, dst)
 
     def move(self, destination):
+        if destination.exists():
+            destination.delete()
         if self.isdir():
             destination.mkdir()
             for child in self.get_children():
-                child.move(safe_join(destination.get_abs_path(), child.get_name()))
+                child.move(self.__class__(self.request, self.root, safe_join(destination.get_path(), child.get_name())))
             self.delete()
         else:
             os.rename(self.get_abs_path(), destination.get_abs_path())
 
     def get_etag(self):
         hash = hashcompat.md5_constructor()
-        hash.update(self.get_abs_path())
+        hash.update(self.get_abs_path().encode('utf-8'))
         hash.update(str(self.get_mtime_stamp()))
         hash.update(str(self.get_size()))
         return hash.hexdigest()
@@ -248,25 +265,26 @@ class DavProperties(object):
             else:
                 value = None
                 ns, bare_name = split_ns(name)
-                if bare_name == 'getetag':
-                    value = res.get_etag()
-                elif bare_name == 'getcontentlength':
-                    value = str(res.get_size())
-                elif bare_name == 'creationdate':
-                    # RFC3339:
-                    value = rfc3339_date(res.get_ctime_stamp())
-                elif bare_name == 'getlastmodified':
-                    # RFC1123:
-                    value = http_date(res.get_mtime_stamp())
-                elif bare_name == 'resourcetype':
-                    if res.isdir():
-                        value = ElementTree.Element("{DAV:}collection")
-                    else:
-                        value = ''
-                elif bare_name == 'displayname':
-                    value = res.get_name()
-                elif bare_name == 'href':
-                    value = res.get_url()
+                if ns != 'DAV':
+                    pass # TODO: support "dead" properties.
+                else:
+                    if bare_name == 'getetag':
+                        value = res.get_etag()
+                    elif bare_name == 'getcontentlength':
+                        value = str(res.get_size())
+                    elif bare_name == 'creationdate':
+                        value = rfc3339_date(res.get_ctime_stamp())     # RFC3339:
+                    elif bare_name == 'getlastmodified':
+                        value = http_date(res.get_mtime_stamp())        # RFC1123:
+                    elif bare_name == 'resourcetype':
+                        if res.isdir():
+                            value = ElementTree.Element("{DAV:}collection")
+                        else:
+                            value = ''
+                    elif bare_name == 'displayname':
+                        value = res.get_name()
+                    elif bare_name == 'href':
+                        value = res.get_url()
                 if value is None:
                     missing.append(name)
                 else:
@@ -359,6 +377,11 @@ class DavServer(object):
         res = self.fs.stat(self.request.path)
         if res.exists():
             return HttpResponseNotAllowed()
+        if not res.get_parent().exists():
+            return HttpResponseConflict()
+        length = self.request.META.get('CONTENT_LENGTH', 0)
+        if length and int(length) != 0:
+            return HttpResponseMediatypeNotSupported()
         acl = self.fs.access(res.get_abs_path())
         if not acl.create:
             return HttpResponseForbidden()
@@ -382,13 +405,13 @@ class DavServer(object):
             return HttpResponseBadGateway('Source and destination must have the same scheme and host.')
         # adjust path for our base url:
         dst = self.fs.stat(dparts.path[len(self.request.get_base()):])
+        if not dst.get_parent().exists():
+            return HttpResponseConflict()
         overwrite = self.request.META.get('HTTP_OVERWRITE', 'T')
         if overwrite not in ('T', 'F'):
             return HttpResponseBadRequest('Overwrite header must be T or F.')
         overwrite = (overwrite == 'T')
-        if dst.isdir():
-            dst = self.fs.stat(safe_join(dst.get_path(), res.get_name()))
-        if not overwrite and dst.isfile():
+        if not overwrite and dst.exists():
             return HttpResponsePreconditionFailed('Destination exists and overwrite False.')
         depth = self.request.META.get('HTTP_DEPTH', 'infinity').lower()
         if not depth in ('0', '1', 'infinity'):
@@ -401,10 +424,7 @@ class DavServer(object):
             return HttpResponseBadRequest()
         if depth not in (0, -1):
             return HttpResponseBadRequest()
-        if dst.exists():
-            response = HttpResponseNoContent()
-        else:
-            response = HttpResponseCreated()
+        dst_exists = dst.exists()
         if move:
             dst.delete()
             errors = res.move(dst)
@@ -412,6 +432,10 @@ class DavServer(object):
             errors = res.copy(dst, depth=depth)
         if errors:
             response = HttpResponseMultiStatus()
+        elif dst_exists:
+            response = HttpResponseNoContent()
+        else:
+            response = HttpResponseCreated()
         return response
 
     def doMOVE(self):
@@ -458,7 +482,8 @@ class DavServer(object):
         else:
             depth = int(depth)
         names_only, props = False, []
-        if int(self.request.META.get('CONTENT_LENGTH', 0)) == 0:
+        length = self.request.META.get('CONTENT_LENGTH', 0)
+        if not length or int(length) == 0:
             # Allow empty request, must be treated as request for all properties.
             props = DAV_LIVE_PROPERTIES
         else:
