@@ -14,6 +14,8 @@ DAV_LIVE_PROPERTIES = (
 )
 
 def safe_join(root, *paths):
+    '''The provided os.path.join() does not work as desired. Any path starting with /
+    will simply be returned rather than actually being joined with the other elements.'''
     if not root.startswith('/'):
         root = '/' + root
     for path in paths:
@@ -25,16 +27,23 @@ def safe_join(root, *paths):
     return root
 
 def url_join(base, *paths):
+    '''Assuming base is the scheme and host (and perhaps path) we will join the remaining
+    path elements to it.'''
     paths = safe_join(*paths)
     while base.endswith('/'):
         base = base[:-1]
     return base + paths
 
-def split_ns(tag):
+def ns_split(tag):
+    '''Splits the namespace and property name from a clark notation property name.'''
     if tag.startswith("{") and "}" in tag:
         ns, name = tag.split("}", 1)
         return (ns[1:-1], name)
     return ("", tag)
+
+def ns_join(ns, name):
+    '''Joins a namespace and property name into clark notation.'''
+    return '{%s:}%s' % (ns, name)
 
 def rfc3339_date(date):
   if not date:
@@ -84,6 +93,8 @@ class HttpResponseBadGateway(HttpResponse):
 
 
 class DavAcl(object):
+    '''Represents all the permissions that a user might have on a resource. This
+    makes it easy to implement virtual permissions.'''
     def __init__(self, read=True, write=True, delete=True, create=True, relocate=True, list=True, all=None):
         if not all is None:
             self.read = self.write = self.delete = \
@@ -97,74 +108,100 @@ class DavAcl(object):
 
 
 class DavResource(object):
+    '''Implements an interface to the file system. This can be subclassed to provide
+    a virtual file system (like say in MySQL). This default implementation simply uses
+    python's os library to do most of the work.'''
     def __init__(self, request, root, path):
         self.request = request
         self.root = root
+        # Trailing / messes with dirname and basename.
         while path.endswith('/'):
             path = path[:-1]
         self.path = path
 
     def get_path(self):
+        '''Return the path of the resource relative to the root.'''
         return self.path
 
     def get_abs_path(self):
+        '''Return the absolute path of the resource. Used internally to interface with
+        an actual file system. If you override all other methods, this one will not
+        be used.'''
         return safe_join(self.root, self.path)
 
     def isdir(self):
+        '''Return True if this resource is a directory (collection in WebDAV parlance).'''
         return os.path.isdir(self.get_abs_path())
 
     def isfile(self):
+        '''Return True if this resource is a file (resource in WebDAV parlance).'''
         return os.path.isfile(self.get_abs_path())
 
     def exists(self):
+        '''Return True if this resource exists.'''
         return os.path.exists(self.get_abs_path())
 
     def get_name(self):
-        path = self.path
-        while path.endswith('/'):
-            path = path[:-1]
-        return os.path.basename(path)
+        '''Return the name of the resource (without path information).'''
+        # No need to use absolute path here
+        return os.path.basename(self.path)
 
     def get_dirname(self):
+        '''Return the resource's parent directory's absolute path.'''
         return os.path.dirname(self.get_abs_path())
 
     def get_size(self):
+        '''Return the size of the resource in bytes.'''
         return os.path.getsize(self.get_abs_path())
 
     def get_ctime_stamp(self):
-        return os.stat(self.get_abs_path()).st_ctime
+        '''Return the create time as UNIX timestamp.'''
+        return os.get_resource(self.get_abs_path()).st_ctime
 
     def get_ctime(self):
+        '''Return the create time as datetime object.'''
         return datetime.datetime.fromtimestamp(self.get_ctime_stamp())
 
     def get_mtime_stamp(self):
-        return os.stat(self.get_abs_path()).st_mtime
+        '''Return the modified time as UNIX timestamp.'''
+        return os.get_resource(self.get_abs_path()).st_mtime
 
     def get_mtime(self):
+        '''Return the modified time as datetime object.'''
         return datetime.datetime.fromtimestamp(self.get_mtime_stamp())
 
     def get_url(self):
+        '''Return the url of the resource. This uses the request base url, so it
+        is likely to work even for an overridden DavResource class.'''
         return url_join(self.request.get_base_url(), self.path)
 
     def get_parent(self):
+        '''Return a DavResource for this resource's parent.'''
         return self.__class__(self.request, self.root, os.path.dirname(self.path))
 
     def get_descendants(self, depth=1, include_self=True):
+        '''Return an iterator of all descendants of this resource.'''
         if include_self:
             yield self
+        # If depth is less than 0, then it started out as -1.
+        # We need to keep recursing until we hit 0, or forever
+        # in case of infinity.
         if depth != 0:
             for child in self.get_children():
                 for desc in child.get_descendants(depth=depth-1, include_self=True):
                     yield desc
 
     def get_children(self):
+        '''Return an iterator of all direct children of this resource.'''
         for child in os.listdir(self.get_abs_path()):
             yield self.__class__(self.request, self.root, os.path.join(self.get_path(), child))
 
     def open(self, mode):
+        '''Open the resource, mode is the same as the Python file() object.'''
         return file(self.get_abs_path(), mode)
 
     def delete(self):
+        '''Delete the resource, recursive is implied.'''
         if self.isdir():
             for child in self.get_children():
                 child.delete()
@@ -173,17 +210,22 @@ class DavResource(object):
             os.remove(self.get_abs_path())
 
     def mkdir(self):
+        '''Create a directory in the location of this resource.'''
         os.mkdir(self.get_abs_path())
 
-    def touch(self):
-        os.close(os.open(self.get_abs_path()))
-
     def copy(self, destination, depth=0):
+        '''Called to copy a resource to a new location. Overwrite is assumed, the DAV server
+        will refuse to copy to an existing resource otherwise. This method needs to gracefully
+        handle a pre-existing destination of any type. It also needs to respect the depth 
+        parameter. depth == -1 is infinity.'''
         if self.isdir():
             if destination.isfile():
                 destination.delete()
             if not destination.isdir():
                 destination.mkdir()
+            # If depth is less than 0, then it started out as -1.
+            # We need to keep recursing until we hit 0, or forever
+            # in case of infinity.
             if depth != 0:
                 for child in self.get_children():
                     child.copy(self.__class__(self.request, self.root, safe_join(destination.get_path(), child.get_name())), depth=depth-1)
@@ -195,6 +237,9 @@ class DavResource(object):
                     shutil.copyfileobj(src, dst)
 
     def move(self, destination):
+        '''Called to move a resource to a new location. Overwrite is assumed, the DAV server
+        will refuse to move to an existing resource otherwise. This method needs to gracefully
+        handle a pre-existing destination of any type.'''
         if destination.exists():
             destination.delete()
         if self.isdir():
@@ -206,6 +251,10 @@ class DavResource(object):
             os.rename(self.get_abs_path(), destination.get_abs_path())
 
     def get_etag(self):
+        '''Calculate an etag for this resource. The default implementation uses an md5 sub of the
+        absolute path modified time and size. Can be overridden if resources are not stored in a
+        file system. The etag is used to detect changes to a resource between HTTP calls. So this
+        needs to change if a resource is modified.'''
         hash = hashcompat.md5_constructor()
         hash.update(self.get_abs_path().encode('utf-8'))
         hash.update(str(self.get_mtime_stamp()))
@@ -225,12 +274,22 @@ class DavRequest(object):
         return getattr(self.request, name)
 
     def get_root(self):
+        '''The root of the (virtual) file system we are exporting via WebDAV. This
+        path is the correlary to the base (base == root). Any paths relative to base
+        should correspond to the same path relative to root.'''
         return self.server.fs.get_root()
 
     def get_base(self):
+        '''Assuming the view is configured via urls.py to pass the path portion using
+        a regular expression, we can subtract the provided path from the full request
+        path to determine our base. This base is what we can make all absolute URLs
+        from.'''
         return self.META['PATH_INFO'][:-len(self.path)]
 
     def get_base_url(self):
+        '''Build a base URL for our request. Uses the base path provided by get_base()
+        and the scheme/host etc. in the request to build a URL that can be used to
+        build absolute URLs for WebDAV resources.'''
         return self.build_absolute_uri(self.get_base())
 
 
@@ -241,13 +300,19 @@ class DavFileSystem(object):
         self.request = request
 
     def get_root(self):
+        '''Return the root of the file system we wish to export. By default the root
+        is read from the DAV_ROOT setting in django's settings.py. You can override
+        this method to export a different directory (maybe even different per user).'''
         return getattr(settings, 'DAV_ROOT', None)
 
-    def access(self, path):
-        '''Return permission as tuple (read, write, delete, create, relocate, list).'''
-        return DavAcl(all=False)
+    def get_acl(self, path):
+        '''Return permission as DavAcl object. A DavACL should have the following attributes:
+        read, write, delete, create, relocate, list. By default we implement a read-only
+        system.'''
+        return DavAcl(list=True, read=True, all=False)
 
-    def stat(self, path):
+    def get_resource(self, path):
+        '''Return a DavResource object to represent the given path.'''
         return self.st_class(self.request, self.get_root(), path)
 
 
@@ -264,7 +329,7 @@ class DavProperties(object):
                     found.append((name, None))
             else:
                 value = None
-                ns, bare_name = split_ns(name)
+                ns, bare_name = ns_split(name)
                 if ns != 'DAV':
                     pass # TODO: support "dead" properties.
                 else:
@@ -315,8 +380,8 @@ class DavServer(object):
         self.lk = self.lk_class(self.request)
 
     def doGET(self, head=False):
-        res = self.fs.stat(self.request.path)
-        acl = self.fs.access(res.get_abs_path())
+        res = self.fs.get_resource(self.request.path)
+        acl = self.fs.get_acl(res.get_abs_path())
         if not head and res.isdir():
             if not acl.list:
                 return HttpResponseForbidden()
@@ -345,12 +410,12 @@ class DavServer(object):
         return HttpResponseNotAllowed('POST method not allowed')
 
     def doPUT(self):
-        res = self.fs.stat(self.request.path)
+        res = self.fs.get_resource(self.request.path)
         if res.isdir():
             return HttpResponseNotAllowed()
         if not res.get_parent().exists():
             return HttpResponseNotFound()
-        acl = self.fs.access(res.get_abs_path())
+        acl = self.fs.get_acl(res.get_abs_path())
         if not acl.write:
             return HttpResponseForbidden()
         created = not res.exists()
@@ -362,10 +427,10 @@ class DavServer(object):
             return HttpResponseNoContent()
 
     def doDELETE(self):
-        res = self.fs.stat(self.request.path)
+        res = self.fs.get_resource(self.request.path)
         if not res.exists():
             return HttpResponseNotFound()
-        acl = self.fs.access(res.get_abs_path())
+        acl = self.fs.get_acl(res.get_abs_path())
         if not acl.delete:
             return HttpResponseForbidden()
         res.delete()
@@ -374,7 +439,7 @@ class DavServer(object):
         return response
 
     def doMKCOL(self):
-        res = self.fs.stat(self.request.path)
+        res = self.fs.get_resource(self.request.path)
         if res.exists():
             return HttpResponseNotAllowed()
         if not res.get_parent().exists():
@@ -382,17 +447,17 @@ class DavServer(object):
         length = self.request.META.get('CONTENT_LENGTH', 0)
         if length and int(length) != 0:
             return HttpResponseMediatypeNotSupported()
-        acl = self.fs.access(res.get_abs_path())
+        acl = self.fs.get_acl(res.get_abs_path())
         if not acl.create:
             return HttpResponseForbidden()
         res.mkdir()
         return HttpResponseCreated()
 
     def doCOPY(self, move=False):
-        res = self.fs.stat(self.request.path)
+        res = self.fs.get_resource(self.request.path)
         if not res.exists():
             return HtpResponseNotFound()
-        acl = self.fs.access(res.get_abs_path())
+        acl = self.fs.get_acl(res.get_abs_path())
         if not acl.relocate:
             return HttpResponseForbidden()
         dst = urllib.unquote(self.request.META.get('HTTP_DESTINATION', ''))
@@ -404,7 +469,7 @@ class DavServer(object):
         if sparts.scheme != dparts.scheme or sparts.netloc != dparts.netloc:
             return HttpResponseBadGateway('Source and destination must have the same scheme and host.')
         # adjust path for our base url:
-        dst = self.fs.stat(dparts.path[len(self.request.get_base()):])
+        dst = self.fs.get_resource(dparts.path[len(self.request.get_base()):])
         if not dst.get_parent().exists():
             return HttpResponseConflict()
         overwrite = self.request.META.get('HTTP_OVERWRITE', 'T')
@@ -453,8 +518,8 @@ class DavServer(object):
         response['Date'] = http_date()
         if self.request.path in ('/', '*'):
             return response
-        res = self.fs.stat(self.request.path)
-        acl = self.fs.access(res.get_abs_path())
+        res = self.fs.get_resource(self.request.path)
+        acl = self.fs.get_acl(res.get_abs_path())
         if not res.exists():
             res = res.get_parent()
             if not res.isdir():
@@ -468,10 +533,10 @@ class DavServer(object):
         return response
 
     def doPROPFIND(self):
-        res = self.fs.stat(self.request.path)
+        res = self.fs.get_resource(self.request.path)
         if not res.exists():
             return HttpResponseNotFound()
-        acl = self.fs.access(res.get_abs_path())
+        acl = self.fs.get_acl(res.get_abs_path())
         if not acl.list:
             return HttpResponseForbidden()
         depth = self.request.META.get('HTTP_DEPTH', 'infinity').lower()
@@ -528,6 +593,6 @@ class DavServer(object):
 
     def get_response(self):
         handler = getattr(self, 'do' + self.request.method, None)
-        if not handler:
+        if not callable(handler):
             return HttpResponseNotFound()
         return handler()
