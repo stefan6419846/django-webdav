@@ -4,3 +4,17 @@ django_webdav/models.py -text
 django_webdav/templates/webdav/index.html -text
 django_webdav/tests.py -text
 django_webdav/views.py -text
+samples/__init__.py -text
+samples/advanced/__init__.py -text
+samples/advanced/models.py -text
+samples/advanced/server.py -text
+samples/advanced/tests.py -text
+samples/advanced/views.py -text
+samples/custom/__init__.py -text
+samples/custom/models.py -text
+samples/custom/server.py -text
+samples/custom/tests.py -text
+samples/custom/views.py -text
+samples/manage.py -text
+samples/settings.py -text
+samples/urls.py -text

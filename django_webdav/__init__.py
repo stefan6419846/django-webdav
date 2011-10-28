@@ -111,9 +111,9 @@ class DavResource(object):
     '''Implements an interface to the file system. This can be subclassed to provide
     a virtual file system (like say in MySQL). This default implementation simply uses
     python's os library to do most of the work.'''
-    def __init__(self, request, root, path):
-        self.request = request
-        self.root = root
+    def __init__(self, server, path):
+        self.server = server
+        self.root = server.get_root()
         # Trailing / messes with dirname and basename.
         while path.endswith('/'):
             path = path[:-1]
@@ -173,12 +173,13 @@ class DavResource(object):
     def get_url(self):
         '''Return the url of the resource. This uses the request base url, so it
         is likely to work even for an overridden DavResource class.'''
-        return url_join(self.request.get_base_url(), self.path)
+        return url_join(self.server.request.get_base_url(), self.path)
 
     def get_parent(self):
         '''Return a DavResource for this resource's parent.'''
-        return self.__class__(self.request, self.root, os.path.dirname(self.path))
+        return self.__class__(self.server, os.path.dirname(self.path))
 
+    # TODO: combine this and get_children()
     def get_descendants(self, depth=1, include_self=True):
         '''Return an iterator of all descendants of this resource.'''
         if include_self:
@@ -191,10 +192,11 @@ class DavResource(object):
                 for desc in child.get_descendants(depth=depth-1, include_self=True):
                     yield desc
 
+    # TODO: combine this and get_descendants()
     def get_children(self):
         '''Return an iterator of all direct children of this resource.'''
         for child in os.listdir(self.get_abs_path()):
-            yield self.__class__(self.request, self.root, os.path.join(self.get_path(), child))
+            yield self.__class__(self.server, os.path.join(self.get_path(), child))
 
     def open(self, mode):
         '''Open the resource, mode is the same as the Python file() object.'''
@@ -228,7 +230,7 @@ class DavResource(object):
             # in case of infinity.
             if depth != 0:
                 for child in self.get_children():
-                    child.copy(self.__class__(self.request, self.root, safe_join(destination.get_path(), child.get_name())), depth=depth-1)
+                    child.copy(self.__class__(self.server, safe_join(destination.get_path(), child.get_name())), depth=depth-1)
         else:
             if destination.isdir():
                 destination.delete()
@@ -245,7 +247,7 @@ class DavResource(object):
         if self.isdir():
             destination.mkdir()
             for child in self.get_children():
-                child.move(self.__class__(self.request, self.root, safe_join(destination.get_path(), child.get_name())))
+                child.move(self.__class__(self.server, safe_join(destination.get_path(), child.get_name())))
             self.delete()
         else:
             os.rename(self.get_abs_path(), destination.get_abs_path())
@@ -273,12 +275,6 @@ class DavRequest(object):
     def __getattr__(self, name):
         return getattr(self.request, name)
 
-    def get_root(self):
-        '''The root of the (virtual) file system we are exporting via WebDAV. This
-        path is the correlary to the base (base == root). Any paths relative to base
-        should correspond to the same path relative to root.'''
-        return self.server.fs.get_root()
-
     def get_base(self):
         '''Assuming the view is configured via urls.py to pass the path portion using
         a regular expression, we can subtract the provided path from the full request
@@ -293,32 +289,9 @@ class DavRequest(object):
         return self.build_absolute_uri(self.get_base())
 
 
-class DavFileSystem(object):
-    st_class = DavResource
-
-    def __init__(self, request):
-        self.request = request
-
-    def get_root(self):
-        '''Return the root of the file system we wish to export. By default the root
-        is read from the DAV_ROOT setting in django's settings.py. You can override
-        this method to export a different directory (maybe even different per user).'''
-        return getattr(settings, 'DAV_ROOT', None)
-
-    def get_acess(self, path):
-        '''Return permission as DavAcl object. A DavACL should have the following attributes:
-        read, write, delete, create, relocate, list. By default we implement a read-only
-        system.'''
-        return DavAcl(list=True, read=True, all=False)
-
-    def get_resource(self, path):
-        '''Return a DavResource object to represent the given path.'''
-        return self.st_class(self.request, self.get_root(), path)
-
-
-class DavProperties(object):
-    def __init__(self, request):
-        self.request = request
+class DavProperty(object):
+    def __init__(self, server):
+        self.server = server
 
     def get_properties(self, res, *names, **kwargs):
         names_only = kwargs.get('names_only', False)
@@ -358,8 +331,8 @@ class DavProperties(object):
 
 
 class DavLock(object):
-    def __init__(self, request):
-        self.request = request
+    def __init__(self, server):
+        self.server = server
 
     def acquire(self, url, type, scope, depth, owner, timeout):
         pass
@@ -369,19 +342,38 @@ class DavLock(object):
 
 
 class DavServer(object):
-    fs_class = DavFileSystem
-    pm_class = DavProperties
-    lk_class = DavLock
-
-    def __init__(self, request, path):
+    def __init__(self, request, path, property_class=DavProperty, resource_class=DavResource, lock_class=DavLock, acl_class=DavAcl):
         self.request = DavRequest(self, request, path)
-        self.fs = self.fs_class(self.request)
-        self.pm = self.pm_class(self.request)
-        self.lk = self.lk_class(self.request)
+        self.resource_class = resource_class
+        self.acl_class = acl_class
+        self.properties = property_class(self)
+        self.locks = lock_class(self)
+
+    def get_root(self):
+        '''Return the root of the file system we wish to export. By default the root
+        is read from the DAV_ROOT setting in django's settings.py. You can override
+        this method to export a different directory (maybe even different per user).'''
+        return getattr(settings, 'DAV_ROOT', None)
+
+    def get_access(self, path):
+        '''Return permission as DavAcl object. A DavACL should have the following attributes:
+        read, write, delete, create, relocate, list. By default we implement a read-only
+        system.'''
+        return self.acl_class(list=True, read=True, all=False)
+
+    def get_resource(self, path):
+        '''Return a DavResource object to represent the given path.'''
+        return self.resource_class(self, path)
+
+    def get_response(self):
+        handler = getattr(self, 'do' + self.request.method, None)
+        if not callable(handler):
+            return HttpResponseNotFound()
+        return handler()
 
     def doGET(self, head=False):
-        res = self.fs.get_resource(self.request.path)
-        acl = self.fs.get_access(res.get_abs_path())
+        res = self.get_resource(self.request.path)
+        acl = self.get_access(res.get_abs_path())
         if not head and res.isdir():
             if not acl.list:
                 return HttpResponseForbidden()
@@ -410,12 +402,12 @@ class DavServer(object):
         return HttpResponseNotAllowed('POST method not allowed')
 
     def doPUT(self):
-        res = self.fs.get_resource(self.request.path)
+        res = self.get_resource(self.request.path)
         if res.isdir():
             return HttpResponseNotAllowed()
         if not res.get_parent().exists():
             return HttpResponseNotFound()
-        acl = self.fs.get_access(res.get_abs_path())
+        acl = self.get_access(res.get_abs_path())
         if not acl.write:
             return HttpResponseForbidden()
         created = not res.exists()
@@ -427,10 +419,10 @@ class DavServer(object):
             return HttpResponseNoContent()
 
     def doDELETE(self):
-        res = self.fs.get_resource(self.request.path)
+        res = self.get_resource(self.request.path)
         if not res.exists():
             return HttpResponseNotFound()
-        acl = self.fs.get_access(res.get_abs_path())
+        acl = self.get_access(res.get_abs_path())
         if not acl.delete:
             return HttpResponseForbidden()
         res.delete()
@@ -439,7 +431,7 @@ class DavServer(object):
         return response
 
     def doMKCOL(self):
-        res = self.fs.get_resource(self.request.path)
+        res = self.get_resource(self.request.path)
         if res.exists():
             return HttpResponseNotAllowed()
         if not res.get_parent().exists():
@@ -447,17 +439,17 @@ class DavServer(object):
         length = self.request.META.get('CONTENT_LENGTH', 0)
         if length and int(length) != 0:
             return HttpResponseMediatypeNotSupported()
-        acl = self.fs.get_access(res.get_abs_path())
+        acl = self.get_access(res.get_abs_path())
         if not acl.create:
             return HttpResponseForbidden()
         res.mkdir()
         return HttpResponseCreated()
 
     def doCOPY(self, move=False):
-        res = self.fs.get_resource(self.request.path)
+        res = self.get_resource(self.request.path)
         if not res.exists():
             return HtpResponseNotFound()
-        acl = self.fs.get_access(res.get_abs_path())
+        acl = self.get_access(res.get_abs_path())
         if not acl.relocate:
             return HttpResponseForbidden()
         dst = urllib.unquote(self.request.META.get('HTTP_DESTINATION', ''))
@@ -469,7 +461,7 @@ class DavServer(object):
         if sparts.scheme != dparts.scheme or sparts.netloc != dparts.netloc:
             return HttpResponseBadGateway('Source and destination must have the same scheme and host.')
         # adjust path for our base url:
-        dst = self.fs.get_resource(dparts.path[len(self.request.get_base()):])
+        dst = self.get_resource(dparts.path[len(self.request.get_base()):])
         if not dst.get_parent().exists():
             return HttpResponseConflict()
         overwrite = self.request.META.get('HTTP_OVERWRITE', 'T')
@@ -518,8 +510,8 @@ class DavServer(object):
         response['Date'] = http_date()
         if self.request.path in ('/', '*'):
             return response
-        res = self.fs.get_resource(self.request.path)
-        acl = self.fs.get_access(res.get_abs_path())
+        res = self.get_resource(self.request.path)
+        acl = self.get_access(res.get_abs_path())
         if not res.exists():
             res = res.get_parent()
             if not res.isdir():
@@ -533,10 +525,10 @@ class DavServer(object):
         return response
 
     def doPROPFIND(self):
-        res = self.fs.get_resource(self.request.path)
+        res = self.get_resource(self.request.path)
         if not res.exists():
             return HttpResponseNotFound()
-        acl = self.fs.get_access(res.get_abs_path())
+        acl = self.get_access(res.get_abs_path())
         if not acl.list:
             return HttpResponseForbidden()
         depth = self.request.META.get('HTTP_DEPTH', 'infinity').lower()
@@ -567,7 +559,7 @@ class DavServer(object):
         for child in res.get_descendants(depth=depth, include_self=True):
             response = ElementTree.SubElement(msr, '{DAV:}response')
             ElementTree.SubElement(response, '{DAV:}href').text = child.get_url()
-            found, missing = self.pm.get_properties(child, *props, names_only=names_only)
+            found, missing = self.properties.get_properties(child, *props, names_only=names_only)
             if found:
                 propstat = ElementTree.SubElement(response, '{DAV:}propstat')
                 ElementTree.SubElement(propstat, '{DAV:}status').text = 'HTTP/1.1 200 OK'
@@ -590,9 +582,3 @@ class DavServer(object):
 
     def doPROPPATCH(self):
         return HttpResponseNotImplemented()
-
-    def get_response(self):
-        handler = getattr(self, 'do' + self.request.method, None)
-        if not callable(handler):
-            return HttpResponseNotFound()
-        return handler()
