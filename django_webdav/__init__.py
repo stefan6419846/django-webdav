@@ -234,9 +234,7 @@ class DavResource(object):
         else:
             if destination.isdir():
                 destination.delete()
-            with destination.open('w') as dst:
-                with self.open('r') as src:
-                    shutil.copyfileobj(src, dst)
+            shutil.copy(self.get_abs_path(), destination.get_abs_path())
 
     def move(self, destination):
         '''Called to move a resource to a new location. Overwrite is assumed, the DAV server
@@ -386,7 +384,22 @@ class DavServer(object):
             elif head:
                 response = HttpResponseNotFound()
             else:
-                response =  HttpResponse(res.open('r'))
+                use_sendfile = getattr(settings, 'DAV_USE_SENDFILE', '').split()
+                if len(use_sendfile) > 0 and use_sendfile[0].lower() == 'x-sendfile':
+                    full_path = res.get_abs_path().encode('utf-8')
+                    if len(use_sendfile) == 2 and use_sendfile[1] == 'escape':
+                        full_path = urllib.quote(full_path)
+                    response = HttpResponse()
+                    response['X-SendFile'] = full_path
+                elif len(use_sendfile) == 2 and use_sendfile[0].lower() == 'x-accel-redir':
+                    full_path = res.get_abs_path().encode('utf-8')
+                    full_path = url_join(use_sendfile[1], full_path)
+                    response = HttpResponse()
+                    response['X-Accel-Redirect'] = full_path
+                    response['X-Accel-Charset'] = 'utf-8'
+                else:
+                    # Do things the slow way:
+                    response =  HttpResponse(res.open('r'))
             if res.exists():
                 response['Content-Type'] = mimetypes.guess_type(res.get_name())
                 response['Content-Length'] = res.get_size()
