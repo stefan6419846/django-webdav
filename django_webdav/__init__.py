@@ -1,17 +1,26 @@
-import os, datetime, mimetypes, time, shutil, urllib, urlparse
+import os, datetime, mimetypes, time, shutil, urllib, urlparse, httplib, re, calendar
 from xml.etree import ElementTree
 from django.conf import settings
 from django.http import HttpResponse, HttpResponseForbidden, HttpResponseNotFound, \
 HttpResponseNotAllowed, HttpResponseBadRequest, HttpResponseNotModified
-from django.utils import hashcompat
-from django.utils.http import http_date
+from django.http import Http404 as HttpNotFound
+from django.utils import hashcompat, synch
+from django.utils.http import http_date, parse_etags
 from django.utils.encoding import smart_unicode
 from django.shortcuts import render_to_response
+try:
+    from email.utils import parsedate_tz
+except ImportError:
+    from email.Utils import parsedate_tz
 
-DAV_LIVE_PROPERTIES = (
-    '{DAV:}getetag', '{DAV:}getcontentlength', '{DAV:}creationdate',
-    '{DAV:}getlastmodified', '{DAV:}resourcetype', '{DAV:}displayname'
-)
+PATTERN_IF_DELIMITER = re.compile(r'(\<([^>]+)\>)|(\(([^\)]+)\))')
+
+# Sun, 06 Nov 1994 08:49:37 GMT  ; RFC 822, updated by RFC 1123
+FORMAT_RFC_822 = '%a, %d %b %Y %H:%M:%S GMT'
+# Sunday, 06-Nov-94 08:49:37 GMT ; RFC 850, obsoleted by RFC 1036
+FORMAT_RFC_850 = '%A %d-%b-%y %H:%M:%S GMT'
+# Sun Nov  6 08:49:37 1994       ; ANSI C's asctime() format
+FORMAT_ASC = '%a %b %d %H:%M:%S %Y'
 
 def safe_join(root, *paths):
     '''The provided os.path.join() does not work as desired. Any path starting with /
@@ -55,41 +64,106 @@ def rfc3339_date(date):
     date += datetime.timedelta(seconds=time.altzone)
   return date.strftime('%Y-%m-%dT%H:%M:%SZ')
 
+def parse_time(time):
+    value = None
+    for fmt in (FORMAT_RFC_822, FORMAT_RFC_850, FORMAT_ASC):
+        try:
+            value = time.strptime(timestring, fmt)
+        except:
+            pass
+    if value is None:
+        try:
+            # Sun Nov  6 08:49:37 1994 +0100      ; ANSI C's asctime() format with timezone
+            value = parsedate_tz(timestring)
+        except:
+            pass
+    if value is None:
+        return
+    return calendar.timegm(result)
+
+
+# When possible, code returns an HTTPResponse sub-class. In some situations, we want to be able
+# to raise an exception to control the response (error conditions within utility functions). In
+# this case, we provide HttpError sub-classes for raising.
+
+
+class HttpError(Exception):
+    '''A base HTTP error class. This allows utility functions to raise an HTTP error so that
+    when used inside a handler, the handler can simply call the utility and the correct 
+    HttpResponse will be issued to the client.'''
+    status_code = 500
+
+    def get_response(self):
+        '''Creates an HTTPResponse for the given status code.'''
+        return HttpResponse(self.message, status_code=self.status_code)
+
+
+class HttpCreated(HttpError):
+    status_code = httplib.CREATED
+
 
 class HttpResponseCreated(HttpResponse):
-    status_code = 201
+    status_code = httplib.CREATED
+
+
+class HttpNoContent(HttpError):
+    status_code = httplib.NO_CONTENT
 
 
 class HttpResponseNoContent(HttpResponse):
-    status_code = 204
+    status_code = httplib.NO_CONTENT
+
+
+class HttpMultiStatus(HttpError):
+    status_code = httplib.MULTI_STATUS
 
 
 class HttpResponseMultiStatus(HttpResponse):
-    status_code = 207
+    status_code = httplib.MULTI_STATUS
+
+
+class HttpNotAllowed(HttpError):
+    status_code = httplib.METHOD_NOT_ALLOWED
 
 
 class HttpResponseNotAllowed(HttpResponse):
-    status_code = 405
+    status_code = httplib.METHOD_NOT_ALLOWED
+
+
+class HttpConflict(HttpError):
+    status_code = httplib.CONFLICT
 
 
 class HttpResponseConflict(HttpResponse):
-    status_code = 409
+    status_code = httplib.CONFLICT
 
 
-class HttpResponseMediatypeNotSupported(HttpResponse):
-    status_code = 415
+class HttpPreconditionFailed(HttpError):
+    status_code = httplib.PRECONDITION_FAILED
 
 
 class HttpResponsePreconditionFailed(HttpResponse):
-    status_code = 412
+    status_code = httplib.PRECONDITION_FAILED
 
 
-class HttpResponseNotImplemented(HttpResponse):
-    status_code = 501
+class HttpMediatypeNotSupported(HttpError):
+    status_code = httplib.UNSUPPORTED_MEDIA_TYPE
+
+
+class HttpResponseMediatypeNotSupported(HttpResponse):
+    status_code = httplib.UNSUPPORTED_MEDIA_TYPE
+
+
+class HttpNotImplemented(HttpError):
+    status_code = httplib.NOT_IMPLEMENTED
+
+
+class HttpBadGateway(HttpError):
+    status_code = httplib.BAD_GATEWAY
 
 
 class HttpResponseBadGateway(HttpResponse):
-    status_code = 502
+    status_code = httplib.BAD_GATEWAY
 
 
 class DavAcl(object):
@@ -288,55 +362,166 @@ class DavRequest(object):
 
 
 class DavProperty(object):
+    LIVE_PROPERTIES = (
+        '{DAV:}getetag', '{DAV:}getcontentlength', '{DAV:}creationdate',
+        '{DAV:}getlastmodified', '{DAV:}resourcetype', '{DAV:}displayname'
+    )
+
     def __init__(self, server):
         self.server = server
+        self.lock = synch.RWLock()
 
-    def get_properties(self, res, *names, **kwargs):
-        names_only = kwargs.get('names_only', False)
-        found, missing = [], []
-        for name in names:
-            if names_only:
-                if name in DAV_LIVE_PROPERTIES:
-                    found.append((name, None))
+    def get_dead_names(self, res):
+        return []
+
+    def get_dead_value(self, res, name):
+        '''Implements "dead" property retrival. Thread synchronization is handled outside this method.'''
+        return
+
+    def set_dead_value(self, res, name, value):
+        '''Implements "dead" property storage. Thread synchronization is handled outside this method.'''
+        return
+
+    def del_dead_prop(self, res, name):
+        '''Implements "dead" property removal. Thread synchronizatioin is handled outside this method.'''
+        return
+
+    def get_prop_names(self, res, *names):
+        return self.LIVE_PROPERTIES + self.get_dead_names(res)
+
+    def get_prop_value(self, res, name):
+        self.lock.reader_enters()
+        try:
+            ns, bare_name = ns_split(name)
+            if ns != 'DAV':
+                return self.get_dead_value(res, name)
             else:
                 value = None
+                if bare_name == 'getetag':
+                    value = res.get_etag()
+                elif bare_name == 'getcontentlength':
+                    value = str(res.get_size())
+                elif bare_name == 'creationdate':
+                    value = rfc3339_date(res.get_ctime_stamp())     # RFC3339:
+                elif bare_name == 'getlastmodified':
+                    value = http_date(res.get_mtime_stamp())        # RFC1123:
+                elif bare_name == 'resourcetype':
+                    if res.isdir():
+                        value = []
+                    else:
+                        value = ''
+                elif bare_name == 'displayname':
+                    value = res.get_name()
+                elif bare_name == 'href':
+                    value = res.get_url()
+            return value
+        finally:
+            self.lock.reader_leaves()
+
+    def set_prop_value(self, res, name, value):
+        self.lock.writer_enters()
+        try:
+            ns, bare_name = ns_split(name)
+            if ns == 'DAV':
+                pass # TODO: handle set-able "live" properties?
+            else:
+                self.set_dead_value(res, name, value)
+        finally:
+            self.lock.writer_leaves()
+
+    def del_props(self, res, *name):
+        self.lock.writer_enters()
+        try:
+            avail_names = self.get_prop_names(res)
+            if not names:
+                names = avail_names
+            for name in names:
                 ns, bare_name = ns_split(name)
-                if ns != 'DAV':
-                    pass # TODO: support "dead" properties.
+                if ns == 'DAV':
+                    pass # TODO: handle delete-able "live" properties?
                 else:
-                    if bare_name == 'getetag':
-                        value = res.get_etag()
-                    elif bare_name == 'getcontentlength':
-                        value = str(res.get_size())
-                    elif bare_name == 'creationdate':
-                        value = rfc3339_date(res.get_ctime_stamp())     # RFC3339:
-                    elif bare_name == 'getlastmodified':
-                        value = http_date(res.get_mtime_stamp())        # RFC1123:
-                    elif bare_name == 'resourcetype':
-                        if res.isdir():
-                            value = ElementTree.Element("{DAV:}collection")
-                        else:
-                            value = ''
-                    elif bare_name == 'displayname':
-                        value = res.get_name()
-                    elif bare_name == 'href':
-                        value = res.get_url()
-                if value is None:
-                    missing.append(name)
-                else:
-                    found.append((name, value))
-        return found, missing
+                    self.del_dead_prop(res, name)
+        finally:
+            self.lock.writer_leaves()
+
+    def copy_props(self, src, dst, *names, **kwargs):
+        move = kwargs.get('move', False)
+        self.lock.writer_enters()
+        try:
+            names = self.get_prop_names(src)
+            for name in names:
+                ns, bare_name = ns_split(name)
+                if ns == 'DAV':
+                    continue
+                self.set_dead_value(dst, name, self.get_prop_value(src, name))
+                if move:
+                    self.del_dead_prop(self, name)
+        finally:
+            self.lock.writer_leaves()
+
+    def get_propstat(self, res, el, *names):
+        '''Returns the XML representation of a resource's properties. Thread synchronization is handled
+        in the get_prop_value() method individually for each property.'''
+        el404, el200 = None, None
+        avail_names = self.get_prop_names(res)
+        if not names:
+            names = avail_names
+        for name in names:
+            if name in avail_names:
+                value = self.get_prop_value(name)
+                if el200 is None:
+                    el200 = ElementTree.SubElement(el, '{DAV:}propstat')
+                    ElementTree.SubElement(el200, '{DAV:}status').text = 'HTTP/1.1 200 OK'
+                prop = ElementTree.SubElement(el200, '{DAV:}prop')
+                prop = ElementTree.SubElement(prop, name)
+                if isinstance(value, list):
+                    prop.append(ElementTree.Element("{DAV:}collection"))
+                elif value:
+                    prop.text = smart_unicode(value)
+            else:
+                if el404 is None:
+                    el404 = ElementTree.SubElement(el, '{DAV:}propstat')
+                    ElementTree.SubElement(el404, '{DAV:}status').text = 'HTTP/1.1 404 Not Found'
+                prop = ElementTree.SubElement(el404, '{DAV:}prop')
+                prop = ElementTree.SubElement(prop, name)
 
 
 class DavLock(object):
     def __init__(self, server):
         self.server = server
+        self.lock = synch.RWLock()
 
-    def acquire(self, url, type, scope, depth, owner, timeout):
-        pass
+    def get(self, res):
+        '''Gets all active locks for the requested resource. Returns a list of locks.'''
+        self.lock.reader_enters()
+        try:
+            pass
+        finally:
+            self.lock.reader_leaves()
 
-    def release(self):
-        pass
+    def acquire(self, res, type, scope, depth, owner, timeout):
+        '''Creates a new lock for the given resource.'''
+        self.lock.writer_enters()
+        try:
+            pass
+        finally:
+            self.lock.writer_leaves()
+
+    def release(self, lock):
+        '''Releases the lock referenced by the given lock id.'''
+        self.lock.writer_enters()
+        try:
+            pass
+        finally:
+            self.lock.writer_leaves()
+
+    def del_locks(self, res):
+        '''Releases all locks for the given resource.'''
+        self.lock.writer_enters()
+        try:
+            pass
+        finally:
+            self.lock.writer_leaves()
 
 
 class DavServer(object):
@@ -344,7 +529,7 @@ class DavServer(object):
         self.request = DavRequest(self, request, path)
         self.resource_class = resource_class
         self.acl_class = acl_class
-        self.properties = property_class(self)
+        self.props = property_class(self)
         self.locks = lock_class(self)
 
     def get_root(self):
@@ -363,11 +548,70 @@ class DavServer(object):
         '''Return a DavResource object to represent the given path.'''
         return self.resource_class(self, path)
 
+    def get_depth(self, default=-1):
+        depth = self.request.META.get('HTTP_DEPTH', default).lower()
+        if not depth in ('0', '1', 'infinity'):
+            raise HttpBadRequest('Invalid depth header value %s' % depth)
+        if depth == 'infinity':
+            depth = -1
+        else:
+            depth = int(depth)
+        return depth
+
+    def evaluate_conditions(self, res):
+        if not res.exists():
+            return
+        etag = res.get_etag()
+        mtime = res.get_mtime_stamp()
+        cond_if_match = self.request.META.get('HTTP_IF_MATCH', None)
+        if cond_if_match:
+            etags = parse_etags(cond_if_match)
+            if '*' in etags or etag in etags:
+                raise HttpPreconditionFailed()
+        cond_if_modified_since = self.request.META.get('HTTP_IF_MODIFIED_SINCE', False)
+        if cond_if_modified_since:
+            # Parse and evaluate, but don't raise anything just yet...
+            # This might be ignored based on If-None-Match evaluation.
+            cond_if_modified_since = parse_time(cond_if_modified_since)
+            if cond_if_modified_since and cond_if_modified_since > mtime:
+                cond_if_modified_since = True
+            else:
+                cond_if_modified_since = False
+        cond_if_none_match = self.request.META.get('HTTP_IF_NONE_MATCH', None)
+        if cond_if_none_match:
+            etags = parse_etags(cond_if_none_match)
+            if '*' in etags or etag in etags:
+                if self.request.method in ('GET', 'HEAD'):
+                    raise HttpNotModified()
+                raise HttpPreconditionFailed()
+            # Ignore If-Modified-Since header...
+            cond_if_modified_since = False
+        cond_if_unmodified_since = self.request.META.get('HTTP_IF_UNMODIFIED_SINCE', None)
+        if cond_if_unmodified_since:
+            cond_if_unmodified_since = parse_time(cond_if_unmodified_since)
+            if cond_if_unmodified_since and cond_if_unmodified_since <= mtime:
+                raise HttpPreconditionFailed()
+        if cond_if_modified_since:
+            # This previously evaluated True and is not being ignored...
+            raise HttpNotModified()
+        # TODO: complete If header handling...
+        cond_if = self.request.META.get('HTTP_IF', None)
+        if cond_if:
+            if not cond_if.startswith('<'):
+                cond_if = '<*>' + cond_if
+            #for (tmpurl, url, tmpcontent, content) in PATTERN_IF_DELIMITER.findall(cond_if):
+                
+
     def get_response(self):
         handler = getattr(self, 'do' + self.request.method, None)
-        if not callable(handler):
-            return HttpResponseNotFound()
-        return handler()
+        try:
+            if not callable(handler):
+                raise HttpMethodNotAllowed()
+            return handler()
+        except HttpError, e:
+            return e.get_response()
+        except Exception, e:
+            return HttpError(str(e)).get_response()
 
     def doGET(self, head=False):
         res = self.get_resource(self.request.path)
@@ -438,6 +682,8 @@ class DavServer(object):
         acl = self.get_access(res.get_abs_path())
         if not acl.delete:
             return HttpResponseForbidden()
+        self.locks.del_locks(res)
+        self.props.del_props(res)
         res.delete()
         response = HttpResponseNoContent()
         response['Date'] = http_date()
@@ -483,23 +729,23 @@ class DavServer(object):
         overwrite = (overwrite == 'T')
         if not overwrite and dst.exists():
             return HttpResponsePreconditionFailed('Destination exists and overwrite False.')
-        depth = self.request.META.get('HTTP_DEPTH', 'infinity').lower()
-        if not depth in ('0', '1', 'infinity'):
-            return HttpResponseBadRequest('Invalid depth header value %s' % depth)
-        if depth == 'infinity':
-            depth = -1
-        else:
-            depth = int(depth)
+        depth = self.get_depth()
         if move and depth != -1:
             return HttpResponseBadRequest()
         if depth not in (0, -1):
             return HttpResponseBadRequest()
         dst_exists = dst.exists()
         if move:
-            dst.delete()
+            if dst_exists:
+                self.locks.del_locks(dst)
+                self.props.del_props(dst)
+                dst.delete()
             errors = res.move(dst)
         else:
             errors = res.copy(dst, depth=depth)
+        self.props.copy(res, dst, move=move)
+        if move:
+            self.locks.del_locks(res)
         if errors:
             response = HttpResponseMultiStatus()
         elif dst_exists:
@@ -544,19 +790,11 @@ class DavServer(object):
         acl = self.get_access(res.get_abs_path())
         if not acl.list:
             return HttpResponseForbidden()
-        depth = self.request.META.get('HTTP_DEPTH', 'infinity').lower()
-        if not depth in ('0', '1', 'infinity'):
-            return HttpResponseBadRequest('Invalid depth header value %s' % depth)
-        if depth == 'infinity':
-            depth = -1
-        else:
-            depth = int(depth)
+        depth = self.get_depth()
         names_only, props = False, []
         length = self.request.META.get('CONTENT_LENGTH', 0)
-        if not length or int(length) == 0:
-            # Allow empty request, must be treated as request for all properties.
-            props = DAV_LIVE_PROPERTIES
-        else:
+        if not length or int(length) != 0:
+            #Otherwise, empty prop list is treated as request for ALL props.
             for ev, el in ElementTree.iterparse(self.request):
                 if el.tag == '{DAV:}allprop':
                     if props:
@@ -572,26 +810,16 @@ class DavServer(object):
         for child in res.get_descendants(depth=depth, include_self=True):
             response = ElementTree.SubElement(msr, '{DAV:}response')
             ElementTree.SubElement(response, '{DAV:}href').text = child.get_url()
-            found, missing = self.properties.get_properties(child, *props, names_only=names_only)
-            if found:
-                propstat = ElementTree.SubElement(response, '{DAV:}propstat')
-                ElementTree.SubElement(propstat, '{DAV:}status').text = 'HTTP/1.1 200 OK'
-                for name, value in found:
-                    prop = ElementTree.SubElement(propstat, '{DAV:}prop')
-                    prop = ElementTree.SubElement(prop, name)
-                    if ElementTree.iselement(value):
-                        prop.append(value)
-                    elif value:
-                        prop.text = smart_unicode(value)
-            if missing:
-                propstat = ElementTree.SubElement(response, '{DAV:}propstat')
-                ElementTree.SubElement(propstat, '{DAV:}status').text = 'HTTP/1.1 404 Not Found'
-                for name in missing:
-                    prop = ElementTree.SubElement(propstat, '{DAV:}prop')
-                    prop = ElementTree.SubElement(prop, name)
+            self.props.get_propstat(child, *props)
         response = HttpResponseMultiStatus(ElementTree.tostring(msr, 'UTF-8'), mimetype='application/xml')
         response['Date'] = http_date()
         return response
 
     def doPROPPATCH(self):
-        return HttpResponseNotImplemented()
+        res = self.get_resource(self.request.path)
+        if not res.exists():
+            return HttpResponseNotFound()
+        depth = self.get_depth(default=0)
+        if depth != 0:
+            return HttpResponseBadRequest('Invalid depth header value %s' % depth)
+        
