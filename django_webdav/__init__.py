@@ -362,10 +362,10 @@ class DavRequest(object):
 
 
 class DavProperty(object):
-    LIVE_PROPERTIES = (
+    LIVE_PROPERTIES = [
         '{DAV:}getetag', '{DAV:}getcontentlength', '{DAV:}creationdate',
         '{DAV:}getlastmodified', '{DAV:}resourcetype', '{DAV:}displayname'
-    )
+    ]
 
     def __init__(self, server):
         self.server = server
@@ -468,7 +468,7 @@ class DavProperty(object):
             names = avail_names
         for name in names:
             if name in avail_names:
-                value = self.get_prop_value(name)
+                value = self.get_prop_value(res, name)
                 if el200 is None:
                     el200 = ElementTree.SubElement(el, '{DAV:}propstat')
                     ElementTree.SubElement(el200, '{DAV:}status').text = 'HTTP/1.1 200 OK'
@@ -606,7 +606,7 @@ class DavServer(object):
         handler = getattr(self, 'do' + self.request.method, None)
         try:
             if not callable(handler):
-                raise HttpMethodNotAllowed()
+                raise HttpNotAllowed()
             return handler()
         except HttpError, e:
             return e.get_response()
@@ -810,7 +810,7 @@ class DavServer(object):
         for child in res.get_descendants(depth=depth, include_self=True):
             response = ElementTree.SubElement(msr, '{DAV:}response')
             ElementTree.SubElement(response, '{DAV:}href').text = child.get_url()
-            self.props.get_propstat(child, *props)
+            self.props.get_propstat(child, response, *props)
         response = HttpResponseMultiStatus(ElementTree.tostring(msr, 'UTF-8'), mimetype='application/xml')
         response['Date'] = http_date()
         return response
