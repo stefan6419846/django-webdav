@@ -18,3 +18,4 @@ samples/custom/views.py -text
 samples/manage.py -text
 samples/settings.py -text
 samples/urls.py -text
+/setup.py -text
