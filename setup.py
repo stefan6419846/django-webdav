@@ -35,8 +35,8 @@ with this such as django-digest etc. to provide a powerful WebDAV server.
     author='SmartFile',
     author_email='btimby@smartfile.com',
     url='http://code.google.com/p/django-webdav/',
-    packages=['django_webdav'
-              'django_webdav.samples'],
+    packages=['django_webdav'],
+              #'django_webdav.samples'],
     classifiers=[
         'Development Status :: 4 - Beta',
         'Environment :: Web Environment',
